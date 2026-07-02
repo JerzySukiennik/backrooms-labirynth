@@ -1,0 +1,798 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<!--
+  Backrooms Labirynth — v1 / Milestone 1: skeleton
+  Three.js first-person walk, PSX render pipeline (low-res + vertex snap +
+  affine UV + gouraud lighting + dither/grain post), one procedural Level 0
+  room, no-clip intro, flickering fluorescent light. Single-file build.
+-->
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Backrooms Labirynth</title>
+<style>
+  @font-face {
+    font-family: 'psx';
+    src: local('Courier New');
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
+  body { font-family: 'VT323', 'psx', monospace; color: #d8c87a; }
+  #app { position: fixed; inset: 0; }
+  canvas { display: block; width: 100%; height: 100%; image-rendering: pixelated; }
+
+  #overlay {
+    position: fixed; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; z-index: 10;
+    background: radial-gradient(ellipse at center, rgba(0,0,0,0.35) 0%, rgba(0,0,0,0.82) 100%);
+    transition: opacity 0.6s ease; cursor: pointer; user-select: none;
+  }
+  #overlay.hidden { opacity: 0; pointer-events: none; }
+  #title {
+    font-size: clamp(42px, 7vw, 96px); letter-spacing: 0.14em; color: #e8d88a;
+    text-shadow: 0 0 18px rgba(220,190,90,0.35), 2px 2px 0 #3a3010;
+    animation: titleflicker 7s infinite;
+  }
+  #subtitle {
+    margin-top: 6px; font-size: clamp(14px, 1.6vw, 22px); letter-spacing: 0.5em;
+    color: #9a8a4a; text-transform: uppercase;
+  }
+  #prompt {
+    margin-top: 64px; font-size: clamp(16px, 2vw, 26px); letter-spacing: 0.3em;
+    color: #cbb964; animation: pulse 1.8s ease-in-out infinite;
+  }
+  #buildtag {
+    position: absolute; bottom: 18px; font-size: 15px; letter-spacing: 0.2em;
+    color: #5a5030;
+  }
+  @keyframes pulse { 0%,100% { opacity: 0.35; } 50% { opacity: 1; } }
+  @keyframes titleflicker {
+    0%, 100% { opacity: 1; }
+    3% { opacity: 0.4; } 3.5% { opacity: 1; }
+    41% { opacity: 1; } 41.4% { opacity: 0.55; } 41.8% { opacity: 1; }
+    76% { opacity: 1; } 76.2% { opacity: 0.3; } 76.4% { opacity: 1; }
+  }
+
+  #pause {
+    position: fixed; inset: 0; display: none; flex-direction: column;
+    align-items: center; justify-content: center; z-index: 9;
+    background: rgba(0,0,0,0.6); cursor: pointer; user-select: none;
+  }
+  #pause.show { display: flex; }
+  #pause h2 { font-size: 44px; letter-spacing: 0.3em; color: #d8c87a; }
+  #pause p { margin-top: 14px; font-size: 18px; letter-spacing: 0.2em; color: #8a7a45; }
+
+  #hud { position: fixed; inset: 0; pointer-events: none; z-index: 5; }
+  #crosshair {
+    position: absolute; left: 50%; top: 50%; width: 4px; height: 4px;
+    margin: -2px 0 0 -2px; border-radius: 50%;
+    background: rgba(230,215,150,0.65); box-shadow: 0 0 4px rgba(0,0,0,0.8);
+  }
+  #fps {
+    position: absolute; top: 10px; right: 12px; font-size: 16px;
+    letter-spacing: 0.1em; color: rgba(216,200,122,0.7);
+    text-shadow: 1px 1px 0 #000;
+  }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="hud">
+  <div id="crosshair"></div>
+  <div id="fps"></div>
+</div>
+<div id="pause">
+  <h2 data-i18n="paused">PAUZA</h2>
+  <p data-i18n="resume">KLIKNIJ ABY WRÓCIĆ</p>
+</div>
+<div id="overlay">
+  <div id="title">BACKROOMS</div>
+  <div id="subtitle">Labirynth</div>
+  <div id="prompt" data-i18n="enter">KLIKNIJ ABY PRZENIKNĄĆ</div>
+  <div id="buildtag">v1 · milestone 1 · skeleton</div>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+
+//======================================================================
+// I18N (host picks language later; auto-detect for now)
+//======================================================================
+const LANG = (navigator.language || 'en').toLowerCase().startsWith('pl') ? 'pl' : 'en';
+const STR = {
+  pl: { paused: 'PAUZA', resume: 'KLIKNIJ ABY WRÓCIĆ', enter: 'KLIKNIJ ABY PRZENIKNĄĆ' },
+  en: { paused: 'PAUSED', resume: 'CLICK TO RESUME', enter: 'CLICK TO NO-CLIP' },
+};
+document.querySelectorAll('[data-i18n]').forEach(el => {
+  el.textContent = STR[LANG][el.dataset.i18n];
+});
+
+//======================================================================
+// CONFIG
+//======================================================================
+const CFG = {
+  cell: 2.0,
+  wallH: 2.6,
+  eyeStand: 1.62,
+  eyeCrouch: 1.02,
+  walkSpeed: 3.1,
+  sprintMul: 1.7,
+  crouchMul: 0.5,
+  accel: 22.0,
+  decel: 16.0,
+  mouseSens: 0.0021,
+  playerR: 0.34,
+  renderHeight: 384,
+  snapGrid: 190.0,
+  fogColor: new THREE.Color(0x2a2410),
+  fogDensity: 0.075,
+  ambient: new THREE.Color(0.46, 0.415, 0.235),
+};
+
+//======================================================================
+// LEVEL 0 MAP  (# wall cell, P pillar, . open)
+//======================================================================
+const MAP = [
+  '################',
+  '#..........#...#',
+  '#.###..###.#.#.#',
+  '#.#......#...#.#',
+  '#.#..PP..####..#',
+  '#....PP........#',
+  '#.#......##..#.#',
+  '#.#..##..##..#.#',
+  '#.####........##',
+  '#........####..#',
+  '##..##.......#.#',
+  '#...##..P..#.#.#',
+  '#.#.....P..#...#',
+  '#.#..####..##..#',
+  '#..............#',
+  '################',
+];
+const MW = MAP[0].length, MH = MAP.length;
+const cellAt = (cx, cz) => (cx < 0 || cz < 0 || cx >= MW || cz >= MH) ? '#' : MAP[cz][cx];
+const cellToWorld = (cx, cz) => [(cx - MW / 2 + 0.5) * CFG.cell, (cz - MH / 2 + 0.5) * CFG.cell];
+const SPAWN = { cx: 8, cz: 5, yaw: Math.PI * 0.9 };
+
+// hand-placed real lights (cell coords); index 0 is the flickering one
+const LIGHT_CELLS = [
+  { cx: 8, cz: 5, flicker: true },
+  { cx: 3, cz: 3 }, { cx: 12, cz: 1 }, { cx: 13, cz: 5 },
+  { cx: 5, cz: 9 }, { cx: 12, cz: 9 }, { cx: 8, cz: 12 },
+  { cx: 3, cz: 14 }, { cx: 13, cz: 14 }, { cx: 6, cz: 6 },
+];
+const LIGHT_COLOR = new THREE.Color(1.0, 0.93, 0.62);
+const LIGHT_RANGE = 7.5;
+
+//======================================================================
+// PROCEDURAL TEXTURES (canonical Level 0, PSX-sized)
+//======================================================================
+function makeCanvas(size, draw) {
+  const c = document.createElement('canvas');
+  c.width = c.height = size;
+  const g = c.getContext('2d');
+  draw(g, size);
+  const t = new THREE.CanvasTexture(c);
+  t.magFilter = THREE.NearestFilter;
+  t.minFilter = THREE.NearestFilter;
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+let seed = 1337;
+function rnd() { seed = (seed * 16807) % 2147483647; return (seed - 1) / 2147483646; }
+
+function noiseOver(g, s, amount, alpha) {
+  const img = g.getImageData(0, 0, s, s), d = img.data;
+  for (let i = 0; i < d.length; i += 4) {
+    const n = (rnd() * 2 - 1) * amount;
+    d[i] += n; d[i + 1] += n; d[i + 2] += n * 0.7;
+  }
+  g.putImageData(img, 0, 0);
+}
+function stains(g, s, count, rMin, rMax, tone, aMax) {
+  for (let i = 0; i < count; i++) {
+    const x = rnd() * s, y = rnd() * s, r = rMin + rnd() * (rMax - rMin);
+    const gr = g.createRadialGradient(x, y, 0, x, y, r);
+    gr.addColorStop(0, `rgba(${tone},${(0.04 + rnd() * aMax).toFixed(3)})`);
+    gr.addColorStop(1, `rgba(${tone},0)`);
+    g.fillStyle = gr;
+    g.fillRect(x - r, y - r, r * 2, r * 2);
+  }
+}
+
+// wallpaper: mono-yellow two-tone vertical stripes, grime + skirting at bottom
+const texWall = makeCanvas(256, (g, s) => {
+  g.fillStyle = '#c3ac50'; g.fillRect(0, 0, s, s);
+  for (let x = 0; x < s; x += 32) {
+    g.fillStyle = '#b7a049'; g.fillRect(x + 9, 0, 14, s);
+    g.fillStyle = '#cdb65b'; g.fillRect(x + 8, 0, 1, s);
+    g.fillStyle = '#cdb65b'; g.fillRect(x + 23, 0, 1, s);
+    g.fillStyle = '#ab9541'; g.fillRect(x + 15, 0, 2, s);
+  }
+  stains(g, s, 9, 20, 70, '70,52,16', 0.10);
+  noiseOver(g, s, 9);
+  const grime = g.createLinearGradient(0, s - 52, 0, s);
+  grime.addColorStop(0, 'rgba(38,28,8,0)');
+  grime.addColorStop(1, 'rgba(38,28,8,0.42)');
+  g.fillStyle = grime; g.fillRect(0, s - 52, s, 52);
+  g.fillStyle = '#6e5f2c'; g.fillRect(0, s - 13, s, 13);
+  g.fillStyle = '#7d6d35'; g.fillRect(0, s - 13, s, 2);
+  g.fillStyle = '#4e4220'; g.fillRect(0, s - 2, s, 2);
+});
+
+// carpet: damp brownish-yellow, heavy speckle, moisture patches
+const texFloor = makeCanvas(256, (g, s) => {
+  g.fillStyle = '#8f7c40'; g.fillRect(0, 0, s, s);
+  for (let i = 0; i < 5200; i++) {
+    const v = rnd();
+    g.fillStyle = v < 0.5 ? 'rgba(60,48,20,0.5)' : 'rgba(168,148,84,0.45)';
+    g.fillRect(rnd() * s, rnd() * s, 1 + rnd() * 1.6, 1 + rnd() * 1.6);
+  }
+  stains(g, s, 12, 26, 92, '30,24,8', 0.16);
+  stains(g, s, 4, 40, 110, '58,54,30', 0.10);
+  noiseOver(g, s, 12);
+});
+
+// drop-ceiling tile: pale, perforated, faint water damage
+const texCeil = makeCanvas(256, (g, s) => {
+  g.fillStyle = '#cfc6ab'; g.fillRect(0, 0, s, s);
+  for (let i = 0; i < 2600; i++) {
+    g.fillStyle = 'rgba(120,112,88,0.35)';
+    g.fillRect(rnd() * s, rnd() * s, 1.4, 1.4);
+  }
+  stains(g, s, 6, 30, 90, '132,108,48', 0.14);
+  g.strokeStyle = '#8f8768'; g.lineWidth = 5;
+  g.strokeRect(0, 0, s, s);
+  g.strokeStyle = 'rgba(70,64,44,0.7)'; g.lineWidth = 2;
+  g.strokeRect(2, 2, s - 4, s - 4);
+  noiseOver(g, s, 7);
+});
+
+// fluorescent panel: prismatic diffuser grid
+const texPanel = makeCanvas(128, (g, s) => {
+  const gr = g.createRadialGradient(s / 2, s / 2, 8, s / 2, s / 2, s * 0.75);
+  gr.addColorStop(0, '#fffbe0');
+  gr.addColorStop(0.75, '#f2e6a8');
+  gr.addColorStop(1, '#d8c882');
+  g.fillStyle = gr; g.fillRect(0, 0, s, s);
+  g.strokeStyle = 'rgba(190,170,110,0.55)'; g.lineWidth = 1;
+  for (let i = 0; i <= s; i += 8) {
+    g.beginPath(); g.moveTo(i, 0); g.lineTo(i, s); g.stroke();
+    g.beginPath(); g.moveTo(0, i); g.lineTo(s, i); g.stroke();
+  }
+  g.strokeStyle = '#8a7d54'; g.lineWidth = 6; g.strokeRect(0, 0, s, s);
+});
+
+//======================================================================
+// PSX SHADERS (vertex snap + affine UV + gouraud point lights + fog)
+//======================================================================
+const NUM_LIGHTS = LIGHT_CELLS.length;
+
+const psxVertex = /* glsl */`
+  uniform float uSnap;
+  uniform vec3 uLightPos[${NUM_LIGHTS}];
+  uniform vec3 uLightColor[${NUM_LIGHTS}];
+  uniform float uLightIntensity[${NUM_LIGHTS}];
+  uniform vec3 uAmbient;
+  uniform float uFogDensity;
+  varying vec2 vUvW;
+  varying float vW;
+  varying vec3 vLight;
+  varying float vFog;
+  void main() {
+    vec3 wp = position;
+    vec3 n = normal;
+    vec3 acc = uAmbient;
+    for (int i = 0; i < ${NUM_LIGHTS}; i++) {
+      vec3 toL = uLightPos[i] - wp;
+      float d = length(toL);
+      float nd = max(dot(n, toL / max(d, 0.001)), 0.0);
+      float att = uLightIntensity[i] * 1.5 / (1.0 + 0.10 * d * d);
+      att *= smoothstep(${LIGHT_RANGE.toFixed(1)}, ${(LIGHT_RANGE * 0.4).toFixed(1)}, d);
+      acc += uLightColor[i] * (nd * 0.7 + 0.3) * att;
+    }
+    vLight = acc;
+    vec4 mv = modelViewMatrix * vec4(position, 1.0);
+    vFog = 1.0 - exp(-uFogDensity * uFogDensity * dot(mv.xyz, mv.xyz));
+    vec4 clip = projectionMatrix * mv;
+    vec3 ndc = clip.xyz / clip.w;
+    ndc.xy = floor(ndc.xy * uSnap + 0.5) / uSnap;
+    clip.xyz = ndc * clip.w;
+    gl_Position = clip;
+    vUvW = uv * clip.w;
+    vW = clip.w;
+  }
+`;
+const psxFragment = /* glsl */`
+  uniform sampler2D map;
+  uniform vec3 uFogColor;
+  varying vec2 vUvW;
+  varying float vW;
+  varying vec3 vLight;
+  varying float vFog;
+  void main() {
+    vec2 uv = vUvW / vW;
+    vec3 tex = texture2D(map, uv).rgb;
+    vec3 col = tex * vLight;
+    col = mix(col, uFogColor, clamp(vFog, 0.0, 1.0));
+    gl_FragColor = vec4(col, 1.0);
+  }
+`;
+const psxEmissiveVertex = /* glsl */`
+  uniform float uSnap;
+  uniform float uFogDensity;
+  varying vec2 vUvW;
+  varying float vW;
+  varying float vFog;
+  void main() {
+    vec4 mv = modelViewMatrix * vec4(position, 1.0);
+    vFog = 1.0 - exp(-uFogDensity * uFogDensity * dot(mv.xyz, mv.xyz));
+    vec4 clip = projectionMatrix * mv;
+    vec3 ndc = clip.xyz / clip.w;
+    ndc.xy = floor(ndc.xy * uSnap + 0.5) / uSnap;
+    clip.xyz = ndc * clip.w;
+    gl_Position = clip;
+    vUvW = uv * clip.w;
+    vW = clip.w;
+  }
+`;
+const psxEmissiveFragment = /* glsl */`
+  uniform sampler2D map;
+  uniform vec3 uFogColor;
+  uniform float uGlow;
+  varying vec2 vUvW;
+  varying float vW;
+  varying float vFog;
+  void main() {
+    vec2 uv = vUvW / vW;
+    vec3 tex = texture2D(map, uv).rgb * uGlow;
+    vec3 col = mix(tex, uFogColor, clamp(vFog, 0.0, 1.0) * 0.6);
+    gl_FragColor = vec4(col, 1.0);
+  }
+`;
+
+const lightPosArr = [], lightColArr = [], lightIntArr = [];
+for (const L of LIGHT_CELLS) {
+  const [x, z] = cellToWorld(L.cx, L.cz);
+  lightPosArr.push(new THREE.Vector3(x, CFG.wallH - 0.08, z));
+  lightColArr.push(LIGHT_COLOR.clone());
+  lightIntArr.push(1.0);
+}
+const sharedLightUniforms = {
+  uSnap: { value: CFG.snapGrid },
+  uLightPos: { value: lightPosArr },
+  uLightColor: { value: lightColArr },
+  uLightIntensity: { value: lightIntArr },
+  uAmbient: { value: CFG.ambient },
+  uFogColor: { value: CFG.fogColor },
+  uFogDensity: { value: CFG.fogDensity },
+};
+function psxMaterial(tex) {
+  return new THREE.ShaderMaterial({
+    uniforms: { ...sharedLightUniforms, map: { value: tex } },
+    vertexShader: psxVertex,
+    fragmentShader: psxFragment,
+  });
+}
+function psxEmissive(tex, glowUniform) {
+  return new THREE.ShaderMaterial({
+    uniforms: {
+      uSnap: sharedLightUniforms.uSnap,
+      uFogColor: sharedLightUniforms.uFogColor,
+      uFogDensity: sharedLightUniforms.uFogDensity,
+      map: { value: tex },
+      uGlow: glowUniform,
+    },
+    vertexShader: psxEmissiveVertex,
+    fragmentShader: psxEmissiveFragment,
+  });
+}
+
+//======================================================================
+// GEOMETRY — build merged world-space meshes from MAP
+//======================================================================
+const scene = new THREE.Scene();
+scene.background = CFG.fogColor.clone();
+
+function wallQuad(x0, y0, z0, x1, y1, z1, nx, nz, segs) {
+  const w = Math.hypot(x1 - x0, z1 - z0), h = y1 - y0;
+  const geo = new THREE.PlaneGeometry(w, h, segs, 5);
+  const m = new THREE.Matrix4();
+  const yaw = Math.atan2(nx, nz);
+  m.makeRotationY(yaw);
+  m.setPosition((x0 + x1) / 2, (y0 + y1) / 2, (z0 + z1) / 2);
+  geo.applyMatrix4(m);
+  return geo;
+}
+function remapWallUV(geo) {
+  const pos = geo.attributes.position, nrm = geo.attributes.normal, uv = geo.attributes.uv;
+  for (let i = 0; i < pos.count; i++) {
+    const nx = nrm.getX(i), y = pos.getY(i);
+    const along = Math.abs(nx) > 0.5 ? pos.getZ(i) : pos.getX(i);
+    uv.setXY(i, along / CFG.cell, y / CFG.wallH);
+  }
+  uv.needsUpdate = true;
+}
+function remapFlatUV(geo, scale) {
+  const pos = geo.attributes.position, uv = geo.attributes.uv;
+  for (let i = 0; i < pos.count; i++) {
+    uv.setXY(i, pos.getX(i) / scale, pos.getZ(i) / scale);
+  }
+  uv.needsUpdate = true;
+}
+
+const wallGeos = [], H = CFG.wallH, C = CFG.cell;
+for (let cz = 0; cz < MH; cz++) {
+  for (let cx = 0; cx < MW; cx++) {
+    const c = cellAt(cx, cz);
+    const [wx, wz] = cellToWorld(cx, cz);
+    if (c === '#') {
+      const x0 = wx - C / 2, x1 = wx + C / 2, z0 = wz - C / 2, z1 = wz + C / 2;
+      if (cellAt(cx, cz - 1) !== '#') wallGeos.push(wallQuad(x0, 0, z0, x1, H, z0, 0, -1, 4));
+      if (cellAt(cx, cz + 1) !== '#') wallGeos.push(wallQuad(x1, 0, z1, x0, H, z1, 0, 1, 4));
+      if (cellAt(cx - 1, cz) !== '#') wallGeos.push(wallQuad(x0, 0, z1, x0, H, z0, -1, 0, 4));
+      if (cellAt(cx + 1, cz) !== '#') wallGeos.push(wallQuad(x1, 0, z0, x1, H, z1, 1, 0, 4));
+    } else if (c === 'P') {
+      const r = 0.45;
+      wallGeos.push(wallQuad(wx - r, 0, wz - r, wx + r, H, wz - r, 0, -1, 2));
+      wallGeos.push(wallQuad(wx + r, 0, wz + r, wx - r, H, wz + r, 0, 1, 2));
+      wallGeos.push(wallQuad(wx - r, 0, wz + r, wx - r, H, wz - r, -1, 0, 2));
+      wallGeos.push(wallQuad(wx + r, 0, wz - r, wx + r, H, wz + r, 1, 0, 2));
+    }
+  }
+}
+const wallGeo = mergeGeometries(wallGeos);
+remapWallUV(wallGeo);
+scene.add(new THREE.Mesh(wallGeo, psxMaterial(texWall)));
+
+const floorSize = MW * C;
+const floorGeo = new THREE.PlaneGeometry(floorSize, floorSize, MW * 2, MH * 2);
+floorGeo.rotateX(-Math.PI / 2);
+remapFlatUV(floorGeo, C);
+scene.add(new THREE.Mesh(floorGeo, psxMaterial(texFloor)));
+
+const ceilGeo = new THREE.PlaneGeometry(floorSize, floorSize, MW * 2, MH * 2);
+ceilGeo.rotateX(Math.PI / 2);
+ceilGeo.translate(0, H, 0);
+remapFlatUV(ceilGeo, 1.3);
+scene.add(new THREE.Mesh(ceilGeo, psxMaterial(texCeil)));
+
+// fluorescent panels: emissive quads on ceiling — real-light cells + filler pattern
+const panelGeos = [];
+const flickerGlow = { value: 1.0 };
+const steadyGlow = { value: 1.0 };
+let flickerPanelMesh = null;
+const panelCells = new Set(LIGHT_CELLS.map(L => `${L.cx},${L.cz}`));
+for (let cz = 1; cz < MH - 1; cz++) {
+  for (let cx = 1; cx < MW - 1; cx++) {
+    if (cellAt(cx, cz) === '.' && cx % 3 === 1 && cz % 3 === 1) panelCells.add(`${cx},${cz}`);
+  }
+}
+for (const key of panelCells) {
+  const [cx, cz] = key.split(',').map(Number);
+  if (cellAt(cx, cz) !== '.') continue;
+  const [wx, wz] = cellToWorld(cx, cz);
+  const g = new THREE.PlaneGeometry(1.5, 0.75);
+  g.rotateX(Math.PI / 2);
+  g.translate(wx, H - 0.02, wz);
+  const isFlicker = LIGHT_CELLS[0].cx === cx && LIGHT_CELLS[0].cz === cz;
+  if (isFlicker) {
+    flickerPanelMesh = new THREE.Mesh(g, psxEmissive(texPanel, flickerGlow));
+    scene.add(flickerPanelMesh);
+  } else {
+    panelGeos.push(g);
+  }
+}
+scene.add(new THREE.Mesh(mergeGeometries(panelGeos), psxEmissive(texPanel, steadyGlow)));
+
+//======================================================================
+// RENDERER + PSX POST PIPELINE
+//======================================================================
+const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance' });
+renderer.setPixelRatio(1);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+document.getElementById('app').appendChild(renderer.domElement);
+
+const camera = new THREE.PerspectiveCamera(72, 1, 0.05, 60);
+
+let rt = null;
+function makeRT() {
+  const aspect = window.innerWidth / window.innerHeight;
+  const h = CFG.renderHeight, w = Math.round(h * aspect);
+  if (rt) rt.dispose();
+  rt = new THREE.WebGLRenderTarget(w, h, {
+    minFilter: THREE.NearestFilter,
+    magFilter: THREE.NearestFilter,
+    depthBuffer: true,
+  });
+  camera.aspect = aspect;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  postUniforms.uRes.value.set(w, h);
+}
+
+const postUniforms = {
+  tScene: { value: null },
+  uRes: { value: new THREE.Vector2(1, 1) },
+  uTime: { value: 0 },
+  uGlitch: { value: 0 },
+};
+const postScene = new THREE.Scene();
+const postCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+postScene.add(new THREE.Mesh(
+  new THREE.PlaneGeometry(2, 2),
+  new THREE.ShaderMaterial({
+    uniforms: postUniforms,
+    vertexShader: /* glsl */`
+      varying vec2 vUv;
+      void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }
+    `,
+    fragmentShader: /* glsl */`
+      uniform sampler2D tScene;
+      uniform vec2 uRes;
+      uniform float uTime;
+      uniform float uGlitch;
+      varying vec2 vUv;
+      float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+      float bayer2(vec2 a) { a = floor(a); return fract(a.x / 2.0 + a.y * a.y * 0.75); }
+      float bayer4(vec2 a) { return bayer2(0.5 * a) * 0.25 + bayer2(a); }
+      void main() {
+        vec2 uv = vUv;
+        if (uGlitch > 0.001) {
+          float line = floor(uv.y * uRes.y);
+          float shift = (hash(vec2(line, floor(uTime * 24.0))) - 0.5) * 0.22 * uGlitch;
+          uv.x = fract(uv.x + shift);
+          uv.y = fract(uv.y + (hash(vec2(floor(uTime * 13.0), 7.0)) - 0.5) * 0.08 * uGlitch);
+        }
+        vec3 col = texture2D(tScene, uv).rgb;
+        vec2 px = vUv * uRes;
+        float d = bayer4(px) - 0.5;
+        col = floor(col * 31.0 + 0.5 + d * 1.4) / 31.0;
+        float g = hash(px + fract(uTime) * 61.7) - 0.5;
+        col += g * 0.045;
+        if (uGlitch > 0.001) {
+          col = mix(col, vec3(hash(px * 0.7 + uTime * 91.0)), uGlitch * 0.55);
+        }
+        float vig = smoothstep(1.25, 0.42, length(vUv - 0.5) * 1.6);
+        col *= mix(0.72, 1.0, vig);
+        gl_FragColor = vec4(col, 1.0);
+      }
+    `,
+    depthTest: false,
+    depthWrite: false,
+  })
+));
+makeRT();
+window.addEventListener('resize', makeRT);
+
+//======================================================================
+// PLAYER CONTROLLER (grid collision; physics engine arrives in M2)
+//======================================================================
+const [spawnX, spawnZ] = cellToWorld(SPAWN.cx, SPAWN.cz);
+const player = {
+  pos: new THREE.Vector3(spawnX, 0, spawnZ),
+  yaw: SPAWN.yaw, pitch: 0,
+  vel: new THREE.Vector3(),
+  eye: CFG.eyeStand,
+  bobPhase: 0, bobAmp: 0,
+};
+
+const keys = {};
+window.addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if (e.code === 'F3') { e.preventDefault(); fpsEl.style.display = fpsEl.style.display === 'none' ? '' : 'none'; }
+});
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+let locked = false;
+document.addEventListener('pointerlockchange', () => {
+  locked = document.pointerLockElement === renderer.domElement;
+  if (!locked && state === 'play') pauseEl.classList.add('show');
+  else pauseEl.classList.remove('show');
+});
+document.addEventListener('mousemove', e => {
+  if (!locked) return;
+  player.yaw -= e.movementX * CFG.mouseSens;
+  player.pitch -= e.movementY * CFG.mouseSens;
+  player.pitch = Math.max(-1.45, Math.min(1.45, player.pitch));
+});
+
+function solidAt(cx, cz) {
+  const c = cellAt(cx, cz);
+  if (c === '#') return { half: C / 2 };
+  if (c === 'P') return { half: 0.45 };
+  return null;
+}
+function collide(pos) {
+  const r = CFG.playerR;
+  for (let pass = 0; pass < 2; pass++) {
+    const cx = Math.floor((pos.x + MW * C / 2) / C);
+    const cz = Math.floor((pos.z + MH * C / 2) / C);
+    for (let dz = -1; dz <= 1; dz++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        const s = solidAt(cx + dx, cz + dz);
+        if (!s) continue;
+        const [wx, wz] = cellToWorld(cx + dx, cz + dz);
+        const nx = Math.max(wx - s.half, Math.min(pos.x, wx + s.half));
+        const nz = Math.max(wz - s.half, Math.min(pos.z, wz + s.half));
+        let ddx = pos.x - nx, ddz = pos.z - nz;
+        let dist = Math.hypot(ddx, ddz);
+        if (dist >= r) continue;
+        if (dist < 1e-5) { ddx = pos.x - wx; ddz = pos.z - wz; dist = Math.hypot(ddx, ddz) || 1; }
+        const push = (r - dist) / dist;
+        pos.x += ddx * push;
+        pos.z += ddz * push;
+      }
+    }
+  }
+}
+
+function updatePlayer(dt) {
+  const fwd = new THREE.Vector3(-Math.sin(player.yaw), 0, -Math.cos(player.yaw));
+  const right = new THREE.Vector3(-fwd.z, 0, fwd.x);
+  const wish = new THREE.Vector3();
+  if (keys['KeyW']) wish.add(fwd);
+  if (keys['KeyS']) wish.sub(fwd);
+  if (keys['KeyD']) wish.add(right);
+  if (keys['KeyA']) wish.sub(right);
+  const crouching = keys['ControlLeft'] || keys['ControlRight'];
+  const sprinting = (keys['ShiftLeft'] || keys['ShiftRight']) && !crouching;
+  let speed = CFG.walkSpeed * (sprinting ? CFG.sprintMul : 1) * (crouching ? CFG.crouchMul : 1);
+  if (wish.lengthSq() > 0) {
+    wish.normalize().multiplyScalar(speed);
+    player.vel.x += (wish.x - player.vel.x) * Math.min(1, CFG.accel * dt);
+    player.vel.z += (wish.z - player.vel.z) * Math.min(1, CFG.accel * dt);
+  } else {
+    player.vel.x -= player.vel.x * Math.min(1, CFG.decel * dt);
+    player.vel.z -= player.vel.z * Math.min(1, CFG.decel * dt);
+  }
+  player.pos.x += player.vel.x * dt;
+  player.pos.z += player.vel.z * dt;
+  collide(player.pos);
+
+  const targetEye = crouching ? CFG.eyeCrouch : CFG.eyeStand;
+  player.eye += (targetEye - player.eye) * Math.min(1, 10 * dt);
+
+  const moveAmt = Math.hypot(player.vel.x, player.vel.z);
+  const targetAmp = moveAmt > 0.3 ? (sprinting ? 0.045 : 0.028) : 0;
+  player.bobAmp += (targetAmp - player.bobAmp) * Math.min(1, 8 * dt);
+  player.bobPhase += moveAmt * dt * 4.6;
+
+  camera.position.set(
+    player.pos.x + Math.cos(player.yaw) * Math.sin(player.bobPhase * 0.5) * player.bobAmp * 0.6,
+    player.eye + Math.abs(Math.sin(player.bobPhase)) * player.bobAmp,
+    player.pos.z
+  );
+  camera.rotation.order = 'YXZ';
+  camera.rotation.set(player.pitch, player.yaw, Math.sin(player.bobPhase * 0.5) * player.bobAmp * 0.35);
+
+  const targetFov = sprinting && moveAmt > 2 ? 78 : 72;
+  if (Math.abs(camera.fov - targetFov) > 0.1) {
+    camera.fov += (targetFov - camera.fov) * Math.min(1, 6 * dt);
+    camera.updateProjectionMatrix();
+  }
+}
+
+//======================================================================
+// FLUORESCENT FLICKER (random telegraph stutter)
+//======================================================================
+let flickTimer = 0, flickState = 1;
+function updateFlicker(t, dt) {
+  flickTimer -= dt;
+  if (flickTimer <= 0) {
+    if (flickState === 1) {
+      flickState = Math.random() < 0.75 ? 2 : 0;
+      flickTimer = flickState === 2 ? 0.03 + Math.random() * 0.1 : 0.05 + Math.random() * 0.25;
+    } else {
+      flickState = 1;
+      flickTimer = 0.4 + Math.random() * 3.2;
+    }
+  }
+  const glow = flickState === 1 ? 1.0 : flickState === 2 ? 0.55 + Math.random() * 0.2 : 0.06;
+  flickerGlow.value = glow;
+  lightIntArr[0] = glow;
+  // gentle mains hum wobble on all steady lights
+  const hum = 1.0 + Math.sin(t * 120.0) * 0.012;
+  for (let i = 1; i < NUM_LIGHTS; i++) lightIntArr[i] = hum;
+}
+
+//======================================================================
+// GAME STATE + INTRO (no-clip drop)
+//======================================================================
+let state = 'menu';
+const overlayEl = document.getElementById('overlay');
+const pauseEl = document.getElementById('pause');
+const fpsEl = document.getElementById('fps');
+let introT = 0;
+const INTRO_LEN = 1.9;
+
+overlayEl.addEventListener('click', () => {
+  if (state !== 'menu') return;
+  state = 'intro';
+  introT = 0;
+  overlayEl.classList.add('hidden');
+  renderer.domElement.requestPointerLock();
+});
+pauseEl.addEventListener('click', () => renderer.domElement.requestPointerLock());
+
+// idle menu camera drift
+let menuT = 0;
+function updateMenuCam(dt) {
+  menuT += dt;
+  const [sx, sz] = cellToWorld(SPAWN.cx, SPAWN.cz);
+  camera.position.set(sx + Math.sin(menuT * 0.11) * 0.4, 1.55, sz + Math.cos(menuT * 0.07) * 0.4);
+  camera.rotation.order = 'YXZ';
+  camera.rotation.set(Math.sin(menuT * 0.13) * 0.04, SPAWN.yaw + Math.sin(menuT * 0.05) * 0.3, 0);
+}
+
+function updateIntro(dt) {
+  introT += dt;
+  const k = Math.min(1, introT / INTRO_LEN);
+  const ease = 1 - Math.pow(1 - k, 3);
+  const [sx, sz] = cellToWorld(SPAWN.cx, SPAWN.cz);
+  camera.position.set(sx, 7.5 - ease * (7.5 - CFG.eyeStand), sz);
+  camera.rotation.order = 'YXZ';
+  const shake = (1 - ease) * 0.12;
+  camera.rotation.set(
+    -0.6 * (1 - ease) + (Math.random() - 0.5) * shake,
+    SPAWN.yaw + (Math.random() - 0.5) * shake * 2,
+    (Math.random() - 0.5) * shake
+  );
+  postUniforms.uGlitch.value = Math.max(0, 1 - ease * 1.15);
+  if (k >= 1) {
+    state = 'play';
+    postUniforms.uGlitch.value = 0;
+  }
+}
+
+//======================================================================
+// MAIN LOOP
+//======================================================================
+let last = performance.now(), fpsAcc = 0, fpsN = 0, fpsClock = 0;
+function loop(now) {
+  requestAnimationFrame(loop);
+  let dt = (now - last) / 1000;
+  last = now;
+  if (dt > 0.1) dt = 0.1;
+  const t = now / 1000;
+
+  postUniforms.uTime.value = t;
+  updateFlicker(t, dt);
+
+  if (state === 'menu') updateMenuCam(dt);
+  else if (state === 'intro') updateIntro(dt);
+  else if (state === 'play' && locked) updatePlayer(dt);
+
+  renderer.setRenderTarget(rt);
+  renderer.render(scene, camera);
+  renderer.setRenderTarget(null);
+  postUniforms.tScene.value = rt.texture;
+  renderer.render(postScene, postCam);
+
+  fpsAcc += dt; fpsN++; fpsClock += dt;
+  if (fpsClock >= 0.5) {
+    fpsEl.textContent = Math.round(fpsN / fpsAcc) + ' FPS';
+    fpsAcc = 0; fpsN = 0; fpsClock = 0;
+  }
+}
+requestAnimationFrame(loop);
+
+// pixel font (graceful fallback to monospace if offline)
+const fontLink = document.createElement('link');
+fontLink.rel = 'stylesheet';
+fontLink.href = 'https://fonts.googleapis.com/css2?family=VT323&display=swap';
+document.head.appendChild(fontLink);
+</script>
+</body>
+</html>
